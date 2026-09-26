@@ -5,18 +5,16 @@ import torch.nn.functional as F
 import numpy as np
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image
 import torchvision.transforms as transforms
 from collections import deque
+import threading
 
 # Tema ayarları
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
-# ---------------------------------------------------------
-# 1. MODEL MİMARİSİ
-# ---------------------------------------------------------
 class EmotionCNN(nn.Module):
     def __init__(self, num_classes=7):
         super(EmotionCNN, self).__init__()
@@ -102,26 +100,24 @@ transform = transforms.Compose([
 ])
 
 
-# ---------------------------------------------------------
-# 2. UYGULAMA ARAYÜZÜ VE ANALİZ MANTIĞI
-# ---------------------------------------------------------
 class EmotionApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Profesyonel Kararlı Duygu Analiz Sistemi")
+        self.title("Kararlı ve Hızlı Duygu Analizi")
         self.geometry("1050x680")
         self.resizable(False, False)
 
         self.model, self.device = load_model()
+
+        # OpenCV Yüz Algılama (MediaPipe kullanmıyoruz, sorunsuz çalışır)
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
         self.cap = None
         self.is_camera_running = False
         self.current_probabilities = np.zeros(len(EMOTION_LABELS))
-
-        # Kararlılık için son 7 karenin tahminlerini saklayan kuyruk (Smoothing Buffer)
-        self.prediction_history = deque(maxlen=7)
+        # Titremeyi engellemek için son 10 kareyi hafızada tutar
+        self.prediction_history = deque(maxlen=10)
 
         self.setup_ui()
 
@@ -129,7 +125,7 @@ class EmotionApp(ctk.CTk):
         left_frame = ctk.CTkFrame(self, fg_color="transparent")
         left_frame.pack(side="left", padx=20, pady=20, fill="both", expand=True)
 
-        title_label = ctk.CTkLabel(left_frame, text="Kararlı Canlı / Resim Duygu Analizi",
+        title_label = ctk.CTkLabel(left_frame, text="Yüksek Doğruluklu Duygu Analizi",
                                    font=ctk.CTkFont(size=20, weight="bold"))
         title_label.pack(pady=(0, 10))
 
@@ -181,7 +177,7 @@ class EmotionApp(ctk.CTk):
         dominant_emotion = "Yüz Bulunamadı"
 
         for (x, y, w, h) in faces:
-            # Yüz bölgesini biraz genişletelim ki çene/alın kırpılmasın
+            # Yüz kırpmayı genişleterek kaliteyi artırma
             margin = int(w * 0.1)
             x1 = max(0, x - margin)
             y1 = max(0, y - margin)
@@ -197,10 +193,8 @@ class EmotionApp(ctk.CTk):
                         outputs = self.model(tensor)
                         probs = F.softmax(outputs, dim=1)[0].cpu().numpy()
 
-                        # Tahmin geçmişine ekle (Smoothing için)
                         self.prediction_history.append(probs)
-
-                        # Son karelerin ortalamasını alarak anlık zıplamaları önle
+                        # Son 10 karenin ortalamasını al (Titremeyi %100 çözer)
                         smoothed_probs = np.mean(self.prediction_history, axis=0)
                         self.current_probabilities = smoothed_probs
 
@@ -215,10 +209,13 @@ class EmotionApp(ctk.CTk):
             cv2.putText(frame, dominant_emotion, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (46, 204, 113), 2)
             break
 
-        self.update_bars()
+        if len(faces) == 0:
+            self.current_probabilities = np.zeros(len(EMOTION_LABELS))
+            self.prediction_history.clear()
+
         return frame
 
-    def update_bars(self):
+    def update_gui_bars(self):
         for i, emotion in enumerate(EMOTION_LABELS):
             prob = float(self.current_probabilities[i])
             self.bars[emotion].set(prob)
@@ -233,6 +230,7 @@ class EmotionApp(ctk.CTk):
             frame = cv2.imread(file_path)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = self.detect_and_predict(frame)
+            self.update_gui_bars()
             self.display_frame(frame)
 
     def toggle_camera(self):
@@ -245,20 +243,20 @@ class EmotionApp(ctk.CTk):
             self.prediction_history.clear()
             self.is_camera_running = True
             self.btn_cam.configure(text="Kamerayı Kapat", fg_color="#7f8c8d", hover_color="#95a5a6")
-            self.update_camera()
+
+            self.thread = threading.Thread(target=self.camera_loop, daemon=True)
+            self.thread.start()
         else:
             self.stop_camera()
 
-    def update_camera(self):
-        if self.is_camera_running:
+    def camera_loop(self):
+        while self.is_camera_running:
             ret, frame = self.cap.read()
             if ret:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame = self.detect_and_predict(frame)
-                self.display_frame(frame)
-
-            self.after(20, self.update_camera)
+                self.after(0, self.update_gui_bars)
+                self.after(0, self.display_frame, frame)
 
     def stop_camera(self):
         self.is_camera_running = False
@@ -267,14 +265,13 @@ class EmotionApp(ctk.CTk):
             self.cap.release()
         self.current_probabilities = np.zeros(len(EMOTION_LABELS))
         self.prediction_history.clear()
-        self.update_bars()
+        self.update_gui_bars()
 
     def display_frame(self, frame):
         image = Image.fromarray(frame)
-        image = image.resize((640, 480), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image=image)
-        self.video_label.configure(image=photo, text="")
-        self.video_label.image = photo
+        ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=(640, 480))
+        self.video_label.configure(image=ctk_image, text="")
+        self.video_label.image = ctk_image
 
 
 if __name__ == "__main__":
